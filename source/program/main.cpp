@@ -59,17 +59,6 @@ const char* g_AllCharacterNames[43] = {
 
 FrontEndCharacterName g_FECarNames[30] = {
     {
-        .carName = "Cars3_Cruz",
-        .localizedName = "Cruz",
-        .carNameUpper = "CARS3_CRUZ",
-    },
-    {
-        .carName = "Cars3_McQueen",
-        .localizedName = "LightningMcQueen",
-        .carNameUpper = "CARS3_MCQUEEN",
-    },
-    /*
-    {
         .carName = "Cars3_McQueen",
         .localizedName = "LightningMcQueen",
         .carNameUpper = "CARS3_MCQUEEN",
@@ -79,7 +68,6 @@ FrontEndCharacterName g_FECarNames[30] = {
         .localizedName = "Cruz",
         .carNameUpper = "CARS3_CRUZ",
     },
-    */
     {
         .carName = "Cars3_Mater",
         .localizedName = "Mater",
@@ -187,8 +175,8 @@ FrontEndCharacterName g_FECarNames[30] = {
     },
     {
         .carName = "Cars3_DocHudson",
-        .localizedName = "",
-        .carNameUpper = "",
+        .localizedName = "DocHudson",
+        .carNameUpper = "CARS3_DOCHUDSON",
     },
     {
         .carName = "Cars3_Crazy8_HighImpact",
@@ -224,6 +212,9 @@ FrontEndCharacterName g_FECarNames[30] = {
 
 constexpr auto CAR_NAME_LIST_LEN = sizeof(g_AllCharacterNames) / sizeof(const char*);
 constexpr auto FE_CAR_NAME_LIST_LEN = sizeof(g_FECarNames) / sizeof(FrontEndCharacterName);
+constexpr auto FE_CAR_NAME_LIST_OFFSET = 24; // Points to the first non-playable character.
+
+static_assert(FE_CAR_NAME_LIST_OFFSET < FE_CAR_NAME_LIST_LEN, "FrontEnd list offset must be less than the size!");
 
 HOOK_DEFINE_INLINE(PatchAllCharacterNames) {
     static void Callback(exl::hook::InlineCtx* ctx) {
@@ -274,10 +265,32 @@ HOOK_DEFINE_INLINE(PatchFECarNames27WithOffset) {
 };
 
 HOOK_DEFINE_INLINE(MountSDCard) {
-    static void Callback(exl::hook::InlineCtx* ctx) {
+    static void Callback(exl::hook::InlineCtx* ctx) {        
         nn::fs::MountSdCardForDebug("sd");
+        nn::fs::CreateFile("sd:/cars3/exlaunch.log", 0);
     }
 };
+
+void LogStringToFile(std::string_view data) {
+    nn::fs::FileHandle handle{};
+    if (R_FAILED(nn::fs::OpenFile(&handle, "sd:/cars3/exlaunch.log", nn::fs::OpenMode::OpenMode_ReadWrite))) {
+        return;
+    }
+    long currentSize = 0;
+    if (R_FAILED(nn::fs::GetFileSize(&currentSize, handle))) {
+        nn::fs::CloseFile(handle);
+        return;
+    }
+    if (R_FAILED(nn::fs::SetFileSize(handle, currentSize + data.size()))) {
+        nn::fs::CloseFile(handle);
+        return;
+    }
+    if (R_FAILED(nn::fs::WriteFile(handle, currentSize, data.data(), data.size(), nn::fs::WriteOption::CreateOption(nn::fs::WriteOptionFlag_Flush)))) {
+        nn::fs::CloseFile(handle);
+        return;
+    }
+    nn::fs::CloseFile(handle);
+}
 
 static const char VERISON[] = "itsmeft24";
 
@@ -287,11 +300,51 @@ HOOK_DEFINE_REPLACE(GetVersionString) {
     }
 };
 
+HOOK_DEFINE_TRAMPOLINE(OpenFile) {
+    static bool Callback(void* _this, const char* fileName, int nOpenFlags) {
+        char workBuffer[256] = {0};
+        std::size_t len = 0;
+        for (std::size_t i = 0; i < 256; i++) {
+            if (fileName[i] == 0) {
+                break;
+            }
+            workBuffer[i] = fileName[i];
+            len++;
+        }
+        workBuffer[len] = '\n';
+        len++;
+        LogStringToFile(std::string_view(workBuffer, len));
+        return Orig(_this, fileName, nOpenFlags);
+    }
+};
+
 extern "C" void exl_main(void* x0, void* x1) {
     /* Setup hooking environment. */
     exl::hook::Initialize();
+
+    /* Mounts the SD Card right after `rom:/` is mounted. */
     MountSDCard::InstallAtOffset(0x1eb74);
+
+    /* Patches the version string that appears at the title screen */
     GetVersionString::InstallAtOffset(0x1fcc4);
+    
+    /* Dumps every file opened to `sd:/cars3/exlaunch.log`. */
+    OpenFile::InstallAtOffset(0x6564);
+    
+    /* Patches the index-offsets used to determine the max character count at the CSS. */
+    // 6dc5c4 = cmp x20, #0x17
+    exl::patch::CodePatcher countPatcher(0x6dc5c4);
+    countPatcher.WriteInst(inst::CmpImmediate(reg::X20, FE_CAR_NAME_LIST_OFFSET));
+    countPatcher.Seek(0x67f950);
+    countPatcher.WriteInst(inst::CmpImmediate(reg::X24, FE_CAR_NAME_LIST_OFFSET));
+    countPatcher.Seek(0x6e31a0);
+    countPatcher.WriteInst(inst::Movz(reg::W0, FE_CAR_NAME_LIST_OFFSET * 4));
+    countPatcher.Seek(0x6e31fc);
+    countPatcher.WriteInst(inst::CmpImmediate(reg::W8, FE_CAR_NAME_LIST_OFFSET));
+
+    /* Unlocks all cars! */
+    countPatcher.Seek(0x6dc54c);
+    countPatcher.WriteInst(inst::Movz(reg::W8, 0));
 
     /* Patch various functions to redirect the original game's g_FECarNames list to ours. */
     PatchFECarNames8::InstallAtOffset(0x6dc4d4);
@@ -299,15 +352,10 @@ extern "C" void exl_main(void* x0, void* x1) {
     PatchFECarNames26WithOffset::InstallAtOffset(0x6e3354);
     PatchFECarNames26::InstallAtOffset(0x6e3a3c);
     PatchFECarNames27WithOffset::InstallAtOffset(0x6e32bc);
-
     PatchFECarNames10Indirect::InstallAtOffset(0x894a84);
     PatchFECarNames26Indirect::InstallAtOffset(0x67f8dc);
 
-    /* Patch a global pointer to g_FECarNames so it points to ours and not the original game's. */
-    // exl::patch::CodePatcher dataPatcher(0x135b9d8);
-    // dataPatcher.Write<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(&g_FECarNames));
-
-    /* Patches HUDTauntParams::Setup to effectively consider 44 instead of 43 entries. */
+    /* Patches HUDTauntParams::Setup to consider all of our g_AllCharacterNames entries. */
     exl::patch::CodePatcher patcher(0x005abae8);
     
     // 0x005abae8 = cmp w8, #0x2b

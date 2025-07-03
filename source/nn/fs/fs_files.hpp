@@ -84,4 +84,11 @@ namespace nn::fs {
         handle: Handle representing file to flush. 
     */
    Result FlushFile(FileHandle handle);
+
+    /*
+        Sets the size of the file.
+        handle: Handle representing the file to set the size for.
+        size:   New file size.
+    */
+    Result SetFileSize(FileHandle handle, s64 size);
 }
